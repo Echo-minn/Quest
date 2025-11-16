@@ -20,6 +20,7 @@ __all__ = [
     "decode_sparse_attn",
     "rms_norm_forward",
     "apply_rope_in_place",
+    "decode_merge_topk_positions",
 ]
 
 def apply_rope_in_place(
@@ -274,3 +275,28 @@ def decode_sparse_attn(
         rope_theta,
     )
     return o
+
+def decode_merge_topk_positions(
+    topk_positions: torch.Tensor,  # [y, num_heads, k], int32 positions in [0, num_pages_without_last)
+    iController: InferenceController,
+    merged_len: int,
+):
+    """
+    Merge y per-score top-k position lists into one length-j per head by frequency.
+    Inputs are local positions; outputs are page ids.
+    """
+    assert iController.inference_page_budget is not None
+    num_pages = iController.inference_page_budget - 1
+    merged_counts = torch.empty((iController.num_heads, merged_len), dtype=torch.int32, device=iController.device)
+    merged_indices = torch.empty((iController.num_heads, merged_len), dtype=torch.int32, device=iController.device)
+    tmp_counts = torch.zeros((iController.num_heads, num_pages), dtype=torch.int32, device=iController.device)
+    _kernels.merge_topk_positions(
+        topk_positions.to(dtype=torch.int32, device=iController.device),
+        iController.kv_indices_without_last,
+        merged_counts,
+        merged_indices,
+        tmp_counts,
+        iController.topk_buf,
+        merged_len,
+    )
+    return merged_indices, merged_counts

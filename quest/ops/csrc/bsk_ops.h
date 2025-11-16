@@ -38,6 +38,25 @@ void topk_filtering(torch::Tensor estimated_value,
 					torch::Tensor buf,
 					unsigned int page_budget);
 
+// Merge y per-score top-k position lists into one length-j per head by frequency.
+// Inputs:
+// - topk_pos: [y, num_heads, k] (int32), positions in range [0, num_pages)
+// - pages_indices: [num_heads, num_pages] (int32), maps local position -> page id
+// - tmp_counts_buf: [num_heads, num_pages] (int32), will be zeroed and used as histogram
+// - select_buf: workspace buffer for RAFT select (char tensor on device)
+// Output:
+// - merged_counts_out: [num_heads, j] (int32), counts of selected pages
+// - merged_indices_out: [num_heads, j] (int32), selected page ids (from pages_indices)
+// Params:
+// - j: desired merged length
+void merge_topk_positions(torch::Tensor topk_pos,
+						  torch::Tensor pages_indices,
+						  torch::Tensor merged_counts_out,
+						  torch::Tensor merged_indices_out,
+						  torch::Tensor tmp_counts_buf,
+						  torch::Tensor select_buf,
+						  unsigned int j);
+
 void estimate_attn_score(torch::Tensor q,
 						 torch::Tensor o,
 						 torch::Tensor metadata_data,
