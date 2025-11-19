@@ -89,6 +89,11 @@ class KvCache:
         device=device
     )
   
+    # self._indicies is a list where each entry is the physical block index in the pool
+    # corresponding to a logical page in the KV cache for this KvCache. That is,
+    # self._indicies[logical_idx] == physical_pool_idx.
+    # It is used to translate logical positions (i.e., which page of the sequence this is)
+    # to the underlying block allocated in the KvPool buffer.
     self._indicies = []
     self._seqlen = 0
 
