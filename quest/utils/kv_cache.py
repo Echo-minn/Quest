@@ -131,3 +131,37 @@ class KvCache:
     for idx in self._indicies:
       self._pool.free_block(idx)
     self._indicies.clear()
+
+  def rollback(self, seq_len_to_remove: int) -> int:
+    """Rollback the KV cache by removing the last n tokens.
+    Returns the number of pages freed.
+    """
+    if seq_len_to_remove <= 0:
+        return 0
+        
+    if seq_len_to_remove > self._seqlen:
+        raise ValueError(f"Cannot rollback {seq_len_to_remove} tokens, current seqlen is {self._seqlen}")
+        
+    freed_page_count = 0
+    
+    # Calculate the new length
+    target_len = self._seqlen - seq_len_to_remove
+    
+    # Calculate how many pages are needed for target_len
+    # ceil(target_len / page_size)
+    if target_len == 0:
+        needed_pages = 0
+    else:
+        needed_pages = (target_len + self._pool.block_len - 1) // self._pool.block_len
+        
+    current_pages = len(self._indicies)
+    
+    # Free pages that are no longer needed
+    while current_pages > needed_pages:
+        idx = self._indicies.pop()
+        self._pool.free_block(idx)
+        freed_page_count += 1
+        current_pages -= 1
+        
+    self._seqlen = target_len
+    return freed_page_count

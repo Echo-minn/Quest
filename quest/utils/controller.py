@@ -75,6 +75,18 @@ class InferenceController:
         # Allocate entry for metadata
         _ = self.metadata_cache.append_seq(appended_new_pages)
     
+    # Rollback metadata and kv cache
+    def rollback(self, seq_len_to_remove: int):
+        if seq_len_to_remove <= 0:
+            return
+        
+        # Rollback metadata cache first, because its unit is 'pages', which is determined by kv_cache rollback
+        freed_kv_pages = self.kv_cache.rollback(seq_len_to_remove)
+        
+        if freed_kv_pages > 0:
+            # metadata_cache stores 1 entry per page.
+            self.metadata_cache.rollback(freed_kv_pages)
+
     # Prepare metadata used for inference under certain PAGE_BUDGET
     # Called multiple times for layer sensitivity
     def begin_forward(self, seq_len: int, updateTensor: bool = True):
@@ -144,4 +156,3 @@ class InferenceController:
     def clean_states(self):
         self.kv_cache.release()
         self.metadata_cache.release()
-        
