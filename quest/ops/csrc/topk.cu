@@ -25,22 +25,22 @@ void topk_filtering(torch::Tensor estimated_value,
 	CHECK_EQ(num_heads, estimated_indices.size(0));
 	CHECK_GE(num_pages, page_budget);
 	CHECK_EQ(estimated_indices.scalar_type(), torch::kInt32);
-	CHECK_EQ(32, num_heads); // Not necessary, but for Llama-7b
+	// CHECK_EQ(32, num_heads); // Not necessary, but for Llama-7b
 	CHECK_EQ(page_budget, d_out.size(1));
 	CHECK_EQ(page_budget, indices_out.size(1));
 	#endif
 
-	bool success = DISPATCH_PYTORCH_DTYPE_TO_CTYPE(estimated_value.scalar_type(), c_type, [&] {
-		decode_select_k<c_type, int32_t, 32>(
-			static_cast<c_type*>(estimated_value.data_ptr()),
-			static_cast<int32_t*>(estimated_indices.data_ptr()),
-			static_cast<char*>(buf.data_ptr()),
-			num_pages,
-			page_budget,
-			static_cast<c_type*>(d_out.data_ptr()),
-			static_cast<int32_t*>(indices_out.data_ptr()),
-			true);
-		return true;
-	});
-	TORCH_CHECK(success, "Top-k filtering failed to dispatch with dtype ", estimated_value.scalar_type());
+    // Use torch::topk instead of Raft
+    auto topk_result = torch::topk(estimated_value, page_budget, /*dim=*/1, /*largest=*/true, /*sorted=*/true);
+    auto topk_vals = std::get<0>(topk_result);
+    auto topk_inds = std::get<1>(topk_result); // indices into estimated_value [H, K]
+
+    d_out.copy_(topk_vals);
+
+    // Gather the original indices
+    // topk_inds is Long (int64), estimated_indices is Int32.
+    // gather requires index to be Long.
+    auto gathered_indices = torch::gather(estimated_indices, 1, topk_inds);
+    
+    indices_out.copy_(gathered_indices);
 }

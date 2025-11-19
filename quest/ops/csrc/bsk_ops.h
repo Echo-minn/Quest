@@ -18,7 +18,6 @@
 
 #include "decode/decode_handler.cuh"
 #include "prefill/prefill.cuh"
-#include "topk/decode_select_k.cuh"
 
 void apply_rope_in_place(torch::Tensor q,
 						 torch::Tensor k,

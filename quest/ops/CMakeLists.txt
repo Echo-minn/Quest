@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.26.4)  # Specify your minimum CMake version
+cmake_minimum_required(VERSION 3.26.4)
 
 set(CMAKE_C_COMPILER "/usr/bin/gcc-11")
 set(CMAKE_CXX_COMPILER "/usr/bin/g++-11")
@@ -10,19 +10,7 @@ if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
     set(CMAKE_CUDA_ARCHITECTURES native)
 endif()
 
-# ------------- configure rapids-cmake --------------#
-include(${CMAKE_SOURCE_DIR}/cmake/fetch_rapids.cmake)
-include(rapids-cmake)
-include(rapids-cpm)
-include(rapids-cuda)
-include(rapids-export)
-include(rapids-find)
-
-project(_kernels LANGUAGES CUDA CXX)  # Replace with your project's name
-
-# ------------- configure raft -----------------#
-rapids_cpm_init()
-include(${CMAKE_SOURCE_DIR}/cmake/get_raft.cmake)
+project(_kernels LANGUAGES CUDA CXX)
 
 # Check: https://stackoverflow.com/questions/68401650/how-can-i-make-a-pytorch-extension-with-cmake
 # Fix linking error: https://github.com/pytorch/pytorch/issues/108041
@@ -42,4 +30,4 @@ target_include_directories(_kernels PRIVATE ${CMAKE_SOURCE_DIR}/../../kernels/in
 target_include_directories(_kernels PRIVATE ${CMAKE_SOURCE_DIR}/../../kernels/3rdparty/flashinfer/include)
 target_include_directories(_kernels PRIVATE ${CMAKE_SOURCE_DIR}/../../kernels/3rdparty/pybind/include)
 target_compile_options(_kernels PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--expt-extended-lambda --expt-relaxed-constexpr>)
-target_link_libraries(_kernels PRIVATE ${TORCH_LIBRARIES} raft::raft Python::Python pybind11::module ${TORCH_PYTHON_LIBRARY})
+target_link_libraries(_kernels PRIVATE ${TORCH_LIBRARIES} Python::Python pybind11::module ${TORCH_PYTHON_LIBRARY})

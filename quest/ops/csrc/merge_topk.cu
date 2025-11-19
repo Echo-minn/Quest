@@ -1,6 +1,5 @@
 #include "bsk_ops.h"
 #include "pytorch_extension_utils.h"
-#include "topk/decode_select_k.cuh"
 
 using namespace flashinfer;
 
@@ -88,16 +87,16 @@ void merge_topk_positions(torch::Tensor topk_pos,
 		num_pages,
 		reinterpret_cast<int32_t*>(tmp_counts_buf.data_ptr()));
 
-	// Select top-j by frequency, mapping positions -> page ids via pages_indices
-	decode_select_k<int32_t, int32_t, 32>(
-		reinterpret_cast<const int32_t*>(tmp_counts_buf.data_ptr()),
-		reinterpret_cast<const int32_t*>(pages_indices.data_ptr()),
-		reinterpret_cast<char*>(select_buf.data_ptr()),
-		num_pages,
-		static_cast<int32_t>(j),
-		reinterpret_cast<int32_t*>(merged_counts_out.data_ptr()),
-		reinterpret_cast<int32_t*>(merged_indices_out.data_ptr()),
-		true);
+	// Select top-j by frequency using torch::topk
+	auto topk_result = torch::topk(tmp_counts_buf, j, /*dim=*/1, /*largest=*/true, /*sorted=*/true);
+	auto topk_vals = std::get<0>(topk_result);
+	auto topk_inds = std::get<1>(topk_result);
+
+	merged_counts_out.copy_(topk_vals);
+
+	// Gather page indices
+	auto gathered_indices = torch::gather(pages_indices, 1, topk_inds);
+	merged_indices_out.copy_(gathered_indices);
 }
 
 
