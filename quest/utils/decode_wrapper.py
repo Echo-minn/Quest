@@ -1,8 +1,11 @@
 import torch
 from typing import Optional
 
-import quest._kernels as _kernels
-from quest.utils.utils import TensorLayout
+try:
+    import quest._kernels as _kernels  # type: ignore[attr-defined]
+except ModuleNotFoundError:
+    import _kernels as _kernels  # type: ignore[assignment]
+from .utils import TensorLayout
 
 def _check_kv_layout(kv_layout: str):
     if not hasattr(TensorLayout, kv_layout):

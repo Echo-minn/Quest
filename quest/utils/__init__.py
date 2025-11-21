@@ -2,11 +2,19 @@ import torch
 import math
 from typing import Optional
 
-import quest._kernels as _kernels
-from quest.utils.utils import TensorLayout
-from quest.utils.kv_cache import KvCache
-from quest.utils.controller import InferenceController
-from quest.utils.decode_wrapper import BatchDecodeWithPagedKVCacheWrapper
+# Import the compiled CUDA/C++ extension.
+# Prefer `quest._kernels` (package-local), but fall back to a top-level
+# `_kernels` if it is available.
+try:
+    import quest._kernels as _kernels  # type: ignore[attr-defined]
+except ModuleNotFoundError:
+    import _kernels as _kernels  # type: ignore[assignment]
+
+# Local helpers (relative imports within this package)
+from .utils import TensorLayout
+from .kv_cache import KvCache
+from .controller import InferenceController
+from .decode_wrapper import BatchDecodeWithPagedKVCacheWrapper
 
 __all__ = [
     'TensorLayout',
@@ -20,7 +28,6 @@ __all__ = [
     "decode_sparse_attn",
     "rms_norm_forward",
     "apply_rope_in_place",
-    "decode_merge_topk_positions",
 ]
 
 def apply_rope_in_place(
@@ -44,9 +51,14 @@ def apply_rope_in_place(
         rope_scale = 1.0
     if rope_theta is None:
         rope_theta = 1e4
+    # The custom CUDA kernel expects contiguous tensors; some upstream ops
+    # (e.g., view/transpose/reshape in attention) may produce non-contiguous
+    # layouts, so we enforce contiguity here.
+    q_contig = q.contiguous()
+    k_contig = k.contiguous()
     _kernels.apply_rope_in_place(
-        q,
-        k,
+        q_contig,
+        k_contig,
         past_kv_len,
         rope_scale,
         rope_theta,
@@ -91,6 +103,11 @@ def append_kv(
         iController: InferenceController object, which contains all needed information.
         layer_idx: Layer index of the KV cache.
     """
+    # Custom CUDA kernels expect contiguous tensors; upstream projections and
+    # reshapes may produce non-contiguous views, so enforce contiguity here.
+    k = k.contiguous()
+    v = v.contiguous()
+
     seq_len = k.size(0)
     if seq_len > 1:
         _kernels.append_kv_cache_prefill(
@@ -155,6 +172,9 @@ def prefill_forward(
     if rope_theta is None:
         rope_theta = 1e4
 
+    # Ensure q is contiguous for the custom kernel.
+    q = q.contiguous()
+
     f = _kernels.prefill_with_paged_kv_cache
     o = f(
         q,
@@ -193,12 +213,19 @@ def decode_estimate(
     f = _kernels.estimate_attn_score
     # (iController.metadata_cache.seqlen - 1) is manually excluding the last elements, which is the current page.
     o = torch.empty((iController.num_heads, iController.metadata_cache.seqlen - 1), dtype=q.dtype, device=q.device)
+
+    # Ensure q and metadata indices/indptr are contiguous for the kernel.
+    q = q.contiguous()
+    metadata_buf = iController.metadata_cache.buf_layer(layer_idx)
+    metadata_indices = iController.metadata_indices.contiguous() if iController.metadata_indices is not None else None
+    metadata_indptr = iController.metadata_indptr_for_append.contiguous() if iController.metadata_indptr_for_append is not None else None
+
     f(
         q,
         o,
-        iController.metadata_cache.buf_layer(layer_idx),
-        iController.metadata_indices,
-        iController.metadata_indptr_for_append,
+        metadata_buf,
+        metadata_indices,
+        metadata_indptr,
         iController.metadata_cache.last_page_len, # One entry delta is considered by kernel-level implementation
         iController.metadata_last_page_idx,
         iController.layout,
@@ -226,16 +253,31 @@ def decode_topk(
         layer_idx: Layer index of the KV cache.
     """
     # excluding the last page
-    page_budet = iController.inference_page_budget - 1
-    f = _kernels.topk_filtering
-    f(
+    page_budget = iController.inference_page_budget - 1
+    if page_budget <= 0:
+        return
+
+    # estimated_attn_score: [num_heads, num_pages_without_last]
+    # kv_indices_without_last: [num_heads, num_pages_without_last] (int32)
+    num_heads, num_pages = estimated_attn_score.shape
+    k = min(page_budget, num_pages)
+
+    # Top-k scores per head
+    topk_vals, topk_pos = torch.topk(
         estimated_attn_score,
-        iController.kv_indices_without_last,
-        iController.topk_dout_buffer,
-        iController.topk_dindices_buffer,
-        iController.topk_buf,
-        page_budet,
-    )
+        k=k,
+        dim=1,
+        largest=True,
+        sorted=True,
+    )  # both [H, k]
+
+    # Map local positions -> page ids via kv_indices_without_last
+    kv_idx_long = iController.kv_indices_without_last.to(dtype=torch.long)
+    topk_pages_long = torch.gather(kv_idx_long, 1, topk_pos)
+
+    # Write into controller buffers (they are preallocated)
+    iController.topk_dout_buffer[:, :k] = topk_vals
+    iController.topk_dindices_buffer[:, :k] = topk_pages_long.to(dtype=torch.int32)
 
 def decode_sparse_attn(
     q: torch.Tensor,
@@ -262,6 +304,10 @@ def decode_sparse_attn(
         layer_idx: Layer index of the KV cache.
         topk_indices: Shape: `[N, page_budget-1]`. Top-k indices.
     """
+    # Ensure q and topk_indices are contiguous for the decode kernel.
+    q = q.contiguous()
+    topk_indices = topk_indices.contiguous()
+
     o = torch.empty_like(q, dtype=q.dtype, device=q.device)
     iController._decode_handler.forward(
         q,
@@ -275,28 +321,3 @@ def decode_sparse_attn(
         rope_theta,
     )
     return o
-
-def decode_merge_topk_positions(
-    topk_positions: torch.Tensor,  # [y, num_heads, k], int32 positions in [0, num_pages_without_last)
-    iController: InferenceController,
-    merged_len: int,
-):
-    """
-    Merge y per-score top-k position lists into one length-j per head by frequency.
-    Inputs are local positions; outputs are page ids.
-    """
-    assert iController.inference_page_budget is not None
-    num_pages = iController.inference_page_budget - 1
-    merged_counts = torch.empty((iController.num_heads, merged_len), dtype=torch.int32, device=iController.device)
-    merged_indices = torch.empty((iController.num_heads, merged_len), dtype=torch.int32, device=iController.device)
-    tmp_counts = torch.zeros((iController.num_heads, num_pages), dtype=torch.int32, device=iController.device)
-    _kernels.merge_topk_positions(
-        topk_positions.to(dtype=torch.int32, device=iController.device),
-        iController.kv_indices_without_last,
-        merged_counts,
-        merged_indices,
-        tmp_counts,
-        iController.topk_buf,
-        merged_len,
-    )
-    return merged_indices, merged_counts

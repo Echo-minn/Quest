@@ -11,7 +11,6 @@ PYBIND11_MODULE(_kernels, m) {
 	m.def("prefill_with_paged_kv_cache",
 		  &prefill_with_paged_kv_cache,
 		  "Multi-request batch prefill with paged KV-Cache operator");
-	m.def("merge_topk_positions", &merge_topk_positions, "Merge y per-score top-k positions into one length-j per head by frequency");
 	py::class_<BatchDecodeWithPagedKVCachePyTorchWrapper>(
 		m, "BatchDecodeWithPagedKVCachePyTorchWrapper")
 		.def(py::init(&BatchDecodeWithPagedKVCachePyTorchWrapper::Create))

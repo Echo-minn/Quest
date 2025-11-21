@@ -39,16 +39,37 @@ class OracleKVAttention(nn.Module):
 
     def _init_rope(self):
         # rope_theta is default to 1e4, as set in RoPE kernel API.
-        if self.config.rope_scaling is None:
-            self.rotary_emb = LlamaRotaryEmbedding(self.head_dim, max_position_embeddings=self.max_position_embeddings)
-            self.rope_scale = 1.0
-        else:
-            scaling_type = self.config.rope_scaling["type"]
+        # Newer LLaMA configs (e.g., Llama-3) may have different or missing
+        # `rope_scaling` fields, so we handle this robustly and fall back to
+        # no scaling if the structure is unknown.
+        rope_scaling = getattr(self.config, "rope_scaling", None)
+
+        # Default: no scaling
+        self.rope_scale = 1.0
+
+        if rope_scaling is None:
+            # Standard RoPE
+            self.rotary_emb = LlamaRotaryEmbedding(
+                self.head_dim, max_position_embeddings=self.max_position_embeddings
+            )
+            return
+
+        # If it's a dict, try to read `type` / `factor`, but don't crash if missing.
+        if isinstance(rope_scaling, dict):
+            scaling_type = rope_scaling.get("type", None)
             if scaling_type == "linear":
-                # support for Longchat-v1.5.
-                self.rope_scale = self.config.rope_scaling["factor"]
+                # Support for LongChat-style linear scaling.
+                self.rope_scale = float(rope_scaling.get("factor", 1.0))
             else:
-                raise ValueError(f"Unknown RoPE scaling type {scaling_type}")
+                # Unknown or new scaling type (e.g. Llama-3 specific).
+                # Fall back to scale 1.0 but still construct the embedding.
+                self.rope_scale = float(rope_scaling.get("factor", 1.0))
+
+        # In all cases, construct a standard rotary embedding; scaling is applied
+        # via `rope_scale` in the kernel.
+        self.rotary_emb = LlamaRotaryEmbedding(
+            self.head_dim, max_position_embeddings=self.max_position_embeddings
+        )
 
     def _shape(self, tensor: torch.Tensor, seq_len: int, bsz: int):
         return tensor.view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
@@ -92,9 +113,26 @@ class OracleKVAttention(nn.Module):
             torch.cuda.nvtx.range_pop()
         
         # Not transposed for Append kv cache NHD layout
+        # query:  [q_len, num_heads, head_dim]
+        # key/val: [q_len, num_key_value_heads, head_dim]
         query_states = query_states.view(q_len, self.num_heads, self.head_dim)
         key_states = key_states.view(q_len, self.num_key_value_heads, self.head_dim)
         value_states = value_states.view(q_len, self.num_key_value_heads, self.head_dim)
+
+        # For GQA (num_key_value_heads < num_heads), repeat K/V heads so RoPE
+        # and KV cache both see per-attention-head K/V of shape [q_len, num_heads, head_dim].
+        if self.num_key_value_heads != self.num_heads:
+            # [q_len, n_kv, d] -> [1, n_kv, q_len, d]
+            k_bnhd = key_states.view(1, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+            v_bnhd = value_states.view(1, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+
+            # Repeat along head dimension
+            k_bnhd = repeat_kv(k_bnhd, self.num_key_value_groups)  # [1, num_heads, q_len, d]
+            v_bnhd = repeat_kv(v_bnhd, self.num_key_value_groups)
+
+            # Back to [q_len, num_heads, d]
+            key_states = k_bnhd.transpose(1, 2).reshape(q_len, self.num_heads, self.head_dim)
+            value_states = v_bnhd.transpose(1, 2).reshape(q_len, self.num_heads, self.head_dim)
 
         torch.cuda.nvtx.range_push("RoPE")
         quest.utils.apply_rope_in_place(query_states, key_states, iController.kv_cache.seqlen - q_len, rope_scale=self.rope_scale)
@@ -179,7 +217,9 @@ class OracleKVAttention(nn.Module):
         if not output_attentions:
             attn_weights = None
 
-        # return the topk indices with highest attention score
-        attn_k_out_indices = iController.topk_dindices_buffer
-        
-        return attn_output, attn_weights, past_key_value, attn_k_out_indices
+        # NOTE: Quest's page-level top-k indices are stored inside the controller
+        # (`iController.topk_dindices_buffer`) and can be accessed out-of-band.
+        # To stay compatible with the HuggingFace LlamaAttention API expected by
+        # `LlamaDecoderLayer`, we only return (attn_output, attn_weights, past_key_value)
+        # here, i.e., exactly three values.
+        return attn_output, attn_weights, past_key_value

@@ -1,6 +1,6 @@
-from quest.utils.decode_wrapper import BatchDecodeWithPagedKVCacheWrapper
-from quest.utils.kv_cache import KvCache
-from quest.utils.utils import TensorLayout
+from .decode_wrapper import BatchDecodeWithPagedKVCacheWrapper
+from .kv_cache import KvCache
+from .utils import TensorLayout
 
 import torch
 

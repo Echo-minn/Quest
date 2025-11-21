@@ -5,16 +5,18 @@ import numpy as np
 import os
 import torch
 from tqdm.auto import tqdm
+from datasets import load_dataset
 
-from transformers import AutoTokenizer
+# Ensure local repo root is on sys.path *before* any site-packages so that the
+# local `quest` package (with compiled `_kernels`) is used instead of any
+# pip-installed version.
+from transformers import AutoTokenizer, BitsAndBytesConfig
 import sys
-sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
-# Assuming oracle_kv is available via the path append or installed
-try:
-    from oracle_kv import LlamaForCausalLM
-except ImportError:
-    # Fallback if running from project root without install
-    from quest.models.llama import LlamaForCausalLM
+repo_root = os.path.join(os.path.dirname(__file__), "..")
+if repo_root not in sys.path:
+    sys.path.insert(0, repo_root)
+# Assuming oracle_kv is available via the path insert or installed
+from oracle_kv.llama import LlamaForCausalLM
 
 @dataclasses.dataclass
 class ModelConfig:
@@ -23,18 +25,21 @@ class ModelConfig:
   device: str = dataclasses.field(default="cuda:0")
 
 TARGET_MODEL_ID = "meta-llama/Meta-Llama-3-8B"
-DRAFT_MODEL_ID  = "meta-llama/Llama-3.2-1B"  
+DRAFT_MODEL_ID = "meta-llama/Llama-3.2-1B-Instruct"
 
-DATASET_ID     = "THUDM/LongBench"
-DATASET_SUBSET = "narrativeqa"
+DATASET_ID     = "Salesforce/wikitext"
+DATASET_SUBSET = "wikitext-2-v1"
 PROMPT_PATH = "./sample.prompt"
 
 PAGE_SIZE       = 32
 TOP_K_PAGES     = 10
-DECODE_LEN  = 256
-PROMPT_MAX_LEN  = 2048
-TOKEN_BUDGET    = 256
-DRAFT_AHEAD_LEN  = 16
+DECODE_LEN      = 256
+PROMPT_MAX_LEN  = 4096
+TOKEN_BUDGET    = 1024
+
+DRAFT_AHEAD_LEN = 4
+
+CONTEXT_LENS = [512, 1024, 2048, 4096, 8192]
 
 OUTPUT_DIR      = "outputs/kv_pages_outputs"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -42,19 +47,23 @@ os.makedirs(OUTPUT_DIR, exist_ok=True)
 def load_model_and_tokenizer(model_cfg: ModelConfig):
     """Load model and tokenizer from pretrained model path."""
     device = torch.device(model_cfg.device)
-    dtype = getattr(torch, model_cfg.dtype)
-    torch.set_default_dtype(dtype)
-
-    with device:
-        model = LlamaForCausalLM.from_pretrained(
-            model_cfg.model_path,
-            device_map=device,
-            torch_dtype=dtype,
-        )
-        tokenizer = AutoTokenizer.from_pretrained(model_cfg.model_path)
-        if tokenizer.pad_token is None:
-            tokenizer.pad_token = tokenizer.eos_token
-
+    # We avoid changing the global default dtype here because it can interfere
+    # with internal ops (e.g., attention mask construction) that assume a
+    # float32 default. Dtype is controlled explicitly via model loading args.
+    bnb_config = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_compute_dtype=torch.float16
+    )
+    model = LlamaForCausalLM.from_pretrained(
+        model_cfg.model_path,
+        quantization_config=bnb_config,
+        device_map=device,
+        torch_dtype=torch.float16,
+    )
+    tokenizer = AutoTokenizer.from_pretrained(model_cfg.model_path)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
     return model, tokenizer
 
 def build_prefetch_maps(draft_model, target_model):
@@ -192,33 +201,85 @@ def prefetch_kv(draft_model, target_model, draft_indices_history):
     selected_pages = pool_buf[0].index_select(0, target_physical)
     _ = selected_pages.sum()
 
-def calculate_overlap(draft_k_out_indices, target_k_out_indices):
-    # draft_k_out_indices, target_k_out_indices are lists of tensors or flat tensors
-    if isinstance(draft_k_out_indices, list):
-        if not draft_k_out_indices:
-             draft = set()
-        else:
-             draft = set(torch.cat([x.view(-1) for x in draft_k_out_indices]).tolist())
+def _flatten_indices(indices):
+    """Helper: flatten list-of-tensors or a single tensor into a Python list."""
+    if isinstance(indices, list):
+        if not indices:
+            return []
+        return torch.cat([x.view(-1) for x in indices]).tolist()
     else:
-        draft = set(draft_k_out_indices.view(-1).tolist())
-        
-    if isinstance(target_k_out_indices, list):
-        if not target_k_out_indices:
-             target = set()
-        else:
-             target = set(torch.cat([x.view(-1) for x in target_k_out_indices]).tolist())
-    else:
-        target = set(target_k_out_indices.view(-1).tolist())
+        return indices.view(-1).tolist()
 
-    inter = len(draft & target)
-    union = len(draft | target)
-    
-    recall = inter / len(target) if len(target) else 0.0
+
+def calculate_overlap(draft_k_out_indices, target_k_out_indices, draft_model, target_model):
+    """
+    Compute overlap between draft / target page selections in **logical page space**.
+
+    Quest 的 `topk_dindices_buffer` 存的是 KV pool 的“物理页 index”：
+      kv_cache.indicies[logical_idx] == physical_idx
+    不同模型的物理页编号不对齐，所以这里先映射回逻辑页编号再做集合重合度，
+    才能和 `spec-kv-validate-demo.py` 的 page overlap 保持语义一致。
+    """
+    draft_ctrl = draft_model.model.iController
+    target_ctrl = target_model.model.iController
+
+    # 物理页 -> 逻辑页 映射
+    draft_phys_to_logical = {phys: logical for logical, phys in enumerate(draft_ctrl.kv_cache.indicies)}
+    target_phys_to_logical = {phys: logical for logical, phys in enumerate(target_ctrl.kv_cache.indicies)}
+
+    # 展平 top-k 物理页 index
+    draft_phys_list = _flatten_indices(draft_k_out_indices)
+    target_phys_list = _flatten_indices(target_k_out_indices)
+
+    # 过滤掉当前缓存中不存在的物理块，映射到逻辑页
+    draft_logical = {
+        draft_phys_to_logical[p]
+        for p in draft_phys_list
+        if p in draft_phys_to_logical
+    }
+    target_logical = {
+        target_phys_to_logical[p]
+        for p in target_phys_list
+        if p in target_phys_to_logical
+    }
+
+    inter = len(draft_logical & target_logical)
+    union = len(draft_logical | target_logical)
+
+    recall = inter / len(target_logical) if len(target_logical) else 0.0
     jaccard = inter / union if union else 0.0
 
     return recall, jaccard
 
-def main():
+def build_prompt(tokenizer, target_ctx_tokens: int):
+    """Build a single synthetic long prompt (no external dataset needed) """
+    
+    print("Building synthetic long prompt...")
+    base_paragraph = (
+        "You are reading a long technical document about large language models, "
+        "speculative decoding, and KV-cache paging. The text continues with detailed "
+        "descriptions of algorithms, experiments, and implementation notes. "
+        "In each section, the author explains how attention heads focus on different "
+        "parts of the context, why some pages are more important than others, and how "
+        "draft and target models may disagree on token predictions.\n"
+    )
+
+    # We iteratively repeat the paragraph until reaching a target token length
+    # (capped by PROMPT_MAX_LEN to stay within the Quest KV budget).
+    prompt_chunks = []
+    cur_len = 0
+    while cur_len < target_ctx_tokens:
+        prompt_chunks.append(base_paragraph)
+        tmp_prompt = "\n".join(prompt_chunks)
+        encoded = tokenizer(tmp_prompt, return_tensors="pt")
+        cur_len = encoded.input_ids.shape[1]
+        if cur_len >= target_ctx_tokens:
+            break
+
+    return encoded.input_ids
+
+
+def run_one_context(context_len_tokens: int):
     dtype = torch.float16
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
@@ -230,33 +291,40 @@ def main():
         print(f"Error loading models: {e}")
         return
 
-    # We define the number of tokens in selected pages as the "Token Budget"
+    # We define the number of tokens in selected pages as the "Token Budget".
+    # `max_seq_len` must be large enough to hold:
+    #   prefill context (<= PROMPT_MAX_LEN)
+    # + planned decode length (DECODE_LEN)
+    # + at most `DRAFT_AHEAD_LEN` extra tokens from the last speculative window.
+    max_seq_len = PROMPT_MAX_LEN + DECODE_LEN + DRAFT_AHEAD_LEN
     target_model.quest_init(
         page_size=PAGE_SIZE,
-        max_seq_len=PROMPT_MAX_LEN + DECODE_LEN,
+        max_seq_len=max_seq_len,
         token_budget=TOKEN_BUDGET,
         dtype=dtype,
         device=device
     )
     draft_model.quest_init(
         page_size=PAGE_SIZE,
-        max_seq_len=PROMPT_MAX_LEN + DECODE_LEN,
+        max_seq_len=max_seq_len,
         token_budget=TOKEN_BUDGET,
         dtype=dtype,
         device=device
-    )
+        )
 
-    if not os.path.exists(PROMPT_PATH):
-        with open(PROMPT_PATH, "w") as f:
-            f.write("This is a sample prompt for testing speculative decoding. " * 50)
-
-    with open(PROMPT_PATH, "r") as f:
-        prompt = f.read()
-
-    prompt_tokenized = target_tokenizer(prompt, return_tensors="pt")
-    input_ids = prompt_tokenized.input_ids.to(device)
+    input_ids = build_prompt(target_tokenizer, target_ctx_tokens=context_len_tokens)
     context_len = input_ids.shape[1]
+
+    # The LongBench context can be extremely long (e.g., >30k tokens), while our
+    # Quest KV-Cache is initialized for at most PROMPT_MAX_LEN + DECODE_LEN tokens.
+    # If we feed more tokens than max_seq_len, the KvPool will run out of free
+    # blocks and raise `KeyError: 'pop from an empty set'`. To avoid this, we
+    # truncate the prompt to the last PROMPT_MAX_LEN tokens before moving to GPU.
+    if context_len > PROMPT_MAX_LEN:
+        input_ids = input_ids[:, -PROMPT_MAX_LEN:]
+        context_len = PROMPT_MAX_LEN
     
+    input_ids = input_ids.to(device)
     print(f"Prompt length: {context_len}")
 
     # prefill stage
@@ -350,10 +418,10 @@ def main():
             if hasattr(target_model.model.iController, 'topk_dindices_buffer'):
                 target_indices_list.append(target_model.model.iController.topk_dindices_buffer.clone())
             
+            # Standard speculative decoding verification:
+            # accept draft token iff it matches the greedy argmax of the target.
             t_pred = torch.argmax(t_out.logits[:, -1, :], dim=-1, keepdim=True)
             
-            # TODO: maybe we can add a threshold to the match check
-            # Check for match
             if t_pred.item() == d_token.item():
                 verified_count += 1
                 t_input = d_token
@@ -362,13 +430,23 @@ def main():
                 curr_input_ids = t_pred
                 break
         else:
-            # All matched
-            curr_input_ids = t_pred
+            # All matched: run one more target step to generate the next token
+            with torch.no_grad():
+                t_out = target_model(
+                    t_input,
+                    use_cache=True,
+                    past_key_values=target_past_key_values
+                )
+            target_past_key_values = t_out.past_key_values
+            if hasattr(target_model.model.iController, 'topk_dindices_buffer'):
+                target_indices_list.append(target_model.model.iController.topk_dindices_buffer.clone())
+            next_target_token = torch.argmax(t_out.logits[:, -1, :], dim=-1, keepdim=True)
+            curr_input_ids = next_target_token
         
-        # Stats
+        # Stats (page overlap in logical page space)
         if target_indices_list:
             draft_slice = draft_indices[:len(target_indices_list)]
-            rec, jac = calculate_overlap(draft_slice, target_indices_list)
+            rec, jac = calculate_overlap(draft_slice, target_indices_list, draft_model, target_model)
             all_recalls.append(rec)
             all_jaccards.append(jac)
         
@@ -390,13 +468,26 @@ def main():
     print(f"Total time: {total_time:.2f}s")
     print(f"Throughput: {DECODE_LEN / total_time:.2f} tokens/s")
     # Accepted tokens
-    print(f"Accepted tokens: {verified_counts}")
+    # print(f"Accepted tokens: {verified_counts}")
     print(f"Avg Accepted tokens: {np.mean(verified_counts):.2f}")
     # Recall and Jaccard
-    print(f"Recall: {all_recalls}")
+    # print(f"Recall: {all_recalls}")
     print(f"Avg Recall: {np.mean(all_recalls):.4f}")
-    print(f"Jaccard: {all_jaccards}")
+    # print(f"Jaccard: {all_jaccards}")
     print(f"Avg Jaccard: {np.mean(all_jaccards):.4f}")
+
+
+def main():
+    results = []
+    for ctx in CONTEXT_LENS:
+        print(f"\n===== Running with context_len = {ctx} tokens =====")
+        thr, rec, jac = run_one_context(ctx)
+        results.append((ctx, thr, rec, jac))
+
+    print("\nSummary:")
+    for ctx, thr, rec, jac in results:
+        print(f"ctx={ctx:4d}  throughput={thr:7.2f} tok/s  "
+              f"AvgRecall={rec:.4f}  AvgJaccard={jac:.4f}")
 
 if __name__ == "__main__":
     main()
