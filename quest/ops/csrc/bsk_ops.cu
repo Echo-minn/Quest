@@ -8,6 +8,7 @@ PYBIND11_MODULE(_kernels, m) {
 	m.def("estimate_attn_score", &estimate_attn_score, "Estimate Attention Score operator");
 	m.def("append_kv_cache_prefill", &append_kv_cache_prefill, "Append KV-Cache Prefill operator");
 	m.def("append_kv_cache_decode", &append_kv_cache_decode, "Append KV-Cache Decode operator");
+	m.def("prefetch_kv_pages", &prefetch_kv_pages, "Prefetch selected KV pages into GPU caches.");
 	m.def("prefill_with_paged_kv_cache",
 		  &prefill_with_paged_kv_cache,
 		  "Multi-request batch prefill with paged KV-Cache operator");

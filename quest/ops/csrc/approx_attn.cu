@@ -24,6 +24,8 @@
 
 using namespace flashinfer;
 
+#include <ATen/cuda/CUDAContext.h>
+
 void BatchDecodeWithPagedKVCachePyTorchWrapper::BeginForward(torch::Tensor indptr,
 															 unsigned int num_qo_heads,
 															 unsigned int num_kv_heads,
@@ -37,6 +39,10 @@ void BatchDecodeWithPagedKVCachePyTorchWrapper::BeginForward(torch::Tensor indpt
 	CHECK_DIM(1, indptr);
 	CHECK_EQ(indptr.scalar_type(), torch::kInt32);
 	#endif
+
+	// Ensure handler uses the same CUDA stream as the current PyTorch context.
+	cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+	handler_.SetCUDAStream(stream);
 
 	bool success = DISPATCH_PYTORCH_DTYPE_TO_CTYPE(empty_data.scalar_type(), c_type, [&] {
 		SWITCH_LAYOUT(kv_layout_, KV_LAYOUT, {

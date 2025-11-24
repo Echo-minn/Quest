@@ -38,7 +38,7 @@ PROMPT_MAX_LEN  = 4096
 TOKEN_BUDGET    = 1024
 # How many tokens the draft model runs ahead before verification.
 # Smaller values reduce wasted draft compute when acceptance rate is low.
-DRAFT_AHEAD_LEN = 4
+DRAFT_AHEAD_LEN = 3
 
 OUTPUT_DIR      = "outputs/kv_pages_outputs"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -356,6 +356,7 @@ def main():
         start_time = time.time()
         
         # 1. Draft Phase
+        torch.cuda.nvtx.range_push("draft_block")
         draft_indices = []
         draft_tokens = []
         
@@ -376,8 +377,10 @@ def main():
 
             temp_input = next_draft_token
             draft_past_key_values = draft_out.past_key_values
+        torch.cuda.nvtx.range_pop()
         
         # 3. Target Phase (Verification)
+        torch.cuda.nvtx.range_push("target_verify")
         target_indices_list = []
         verified_count = 0
         t_input = curr_input_ids
@@ -416,6 +419,7 @@ def main():
                 target_indices_list.append(target_model.model.iController.topk_dindices_buffer.clone())
             next_target_token = torch.argmax(t_out.logits[:, -1, :], dim=-1, keepdim=True)
             curr_input_ids = next_target_token
+        torch.cuda.nvtx.range_pop()
         
         # Stats (page overlap in logical page space)
         if target_indices_list:

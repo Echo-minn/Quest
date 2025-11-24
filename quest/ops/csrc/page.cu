@@ -3,6 +3,10 @@
 
 using namespace flashinfer;
 
+// ---------------------------------------------------------------------------
+// Decode-time KV cache append
+// ---------------------------------------------------------------------------
+
 void append_kv_cache_decode(torch::Tensor k,
 							torch::Tensor v,
 							torch::Tensor kv_data,
@@ -97,6 +101,10 @@ void append_kv_cache_decode(torch::Tensor k,
 
 	TORCH_CHECK(success, "Append_kv_cache_decode failed to dispatch with dtype ", k.scalar_type());
 }
+
+// ---------------------------------------------------------------------------
+// Prefill-time KV cache append
+// ---------------------------------------------------------------------------
 
 void append_kv_cache_prefill(torch::Tensor k,
 							 torch::Tensor v,
@@ -209,6 +217,10 @@ void append_kv_cache_prefill(torch::Tensor k,
 	TORCH_CHECK(success, "Append_kv_cache_prefill failed to dispatch with dtype ", k.scalar_type());
 }
 
+// ---------------------------------------------------------------------------
+// RoPE helper
+// ---------------------------------------------------------------------------
+
 void apply_rope_in_place(torch::Tensor q,
 						 torch::Tensor k,
 						 unsigned int past_kv_len,
@@ -250,4 +262,93 @@ void apply_rope_in_place(torch::Tensor q,
 	});
 
 	TORCH_CHECK(success, "apply_rope_in_place failed to dispatch with dtype ", k.scalar_type());
+}
+
+// ---------------------------------------------------------------------------
+// Lightweight KV prefetch kernel
+//   Touch a subset of elements from selected physical pages to warm caches.
+//   This is meant to be launched on a side stream and overlap with compute.
+// ---------------------------------------------------------------------------
+
+template <typename scalar_t>
+__global__ void prefetch_kv_pages_kernel(
+	scalar_t* __restrict__ kv_data,
+	const int32_t* __restrict__ page_indices,
+	int num_pages,
+	int capacity,
+	int page_size,
+	int num_heads,
+	int head_dim) {
+	// Each thread handles (page, head) pair for token position 0 (key only).
+	int idx = blockIdx.x * blockDim.x + threadIdx.x;
+	int total = num_pages * num_heads;
+	if(idx >= total) {
+		return;
+	}
+
+	int page_idx = idx / num_heads;
+	int head_idx = idx % num_heads;
+
+	int phys = page_indices[page_idx];
+	if(phys < 0 || phys >= capacity) {
+		return;
+	}
+
+	const int token = 0;   // touch first token within the page
+	const int kv_pair = 0; // 0: key, 1: value
+
+	// Layout here is per-layer buffer:
+	//   (capacity, 2, page_size, num_heads, head_dim)
+	size_t offset = (((static_cast<size_t>(phys) * 2 + kv_pair) * page_size + token) * num_heads + head_idx) *
+					head_dim;
+
+	// Read one element to warm caches. Use a dummy conditional write to prevent DCE.
+	scalar_t val = kv_data[offset];
+	if(val == static_cast<scalar_t>(123.456f)) {
+		kv_data[offset] = val;
+	}
+}
+
+void prefetch_kv_pages(torch::Tensor kv_data, torch::Tensor page_indices) {
+#ifdef BSK_TORCH_CHECK
+	CHECK_INPUT(kv_data);
+	CHECK_INPUT(page_indices);
+	// Per-layer KV buffer: (capacity, 2, page_size, num_heads, head_dim)
+	CHECK_DIM(5, kv_data);
+	CHECK_DIM(1, page_indices);
+	CHECK_EQ(page_indices.scalar_type(), torch::kInt32);
+#endif
+
+	int capacity = static_cast<int>(kv_data.size(0));
+	int page_size = static_cast<int>(kv_data.size(2));
+	int num_heads = static_cast<int>(kv_data.size(3));
+	int head_dim = static_cast<int>(kv_data.size(4));
+
+	int num_pages = static_cast<int>(page_indices.size(0));
+	if(num_pages == 0 || num_heads == 0) {
+		return;
+	}
+
+	int total = num_pages * num_heads;
+	int threads = 128;
+	int blocks = (total + threads - 1) / threads;
+
+	bool success = DISPATCH_PYTORCH_DTYPE_TO_CTYPE(kv_data.scalar_type(), c_type, [&] {
+		prefetch_kv_pages_kernel<c_type><<<blocks, threads>>>(
+			static_cast<c_type*>(kv_data.data_ptr()),
+			static_cast<int32_t*>(page_indices.data_ptr()),
+			num_pages,
+			capacity,
+			page_size,
+			num_heads,
+			head_dim);
+
+		cudaError_t status = cudaGetLastError();
+		TORCH_CHECK(status == cudaSuccess,
+					"prefetch_kv_pages failed with error code ",
+					cudaGetErrorString(status));
+		return true;
+	});
+
+	TORCH_CHECK(success, "prefetch_kv_pages failed to dispatch with dtype ", kv_data.scalar_type());
 }

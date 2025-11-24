@@ -93,6 +93,11 @@ void append_kv_cache_decode(torch::Tensor k,
 							unsigned int metadata_last_page_idx,
 							unsigned int layout);
 
+// Lightweight KV-page prefetch (HBM -> caches) for selected physical pages.
+// kv_data: (num_layers, capacity, 2, page_size, num_heads, head_dim)
+// page_indices: [N] int32, physical page indices in [0, capacity)
+void prefetch_kv_pages(torch::Tensor kv_data, torch::Tensor page_indices);
+
 torch::Tensor prefill_with_paged_kv_cache(torch::Tensor q,
 										  torch::Tensor kv_data,
 										  torch::Tensor kv_indices,

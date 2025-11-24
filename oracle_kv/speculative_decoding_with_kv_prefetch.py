@@ -41,9 +41,11 @@ DRAFT_AHEAD_LEN = 4
 
 # Prefetch settings
 # Ratio of unique logical pages (by frequency over a speculative window) to prefetch.
-PREFETCH_RATIO = 0.5
-# How often to run prefetch (in units of speculative windows). 1 = every window.
-PREFETCH_WINDOW_STRIDE = 1
+# Keep this small to limit extra traffic; you can tune in [0.1, 0.5].
+PREFETCH_RATIO = 0.3
+# How often to run prefetch (in units of speculative windows).
+# Using >1 reduces prefetch overhead while still warming pages periodically.
+PREFETCH_WINDOW_STRIDE = 2
 
 OUTPUT_DIR      = "outputs/kv_pages_outputs"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -104,7 +106,14 @@ def build_prefetch_maps(draft_model, target_model):
     
     return draft_phys_to_logical, target_logical_to_phys
 
-def prefetch_step_async(draft_indices, draft_phys_to_logical, target_logical_to_phys, pool_buf, stream):
+def prefetch_step_async(
+    draft_indices,
+    draft_phys_to_logical,
+    target_logical_to_phys,
+    pool_buf,
+    stream,
+    fetch_ratio: float = 1.0,
+):
     """
     Async version of prefetch for a single step.
     Launch on the provided stream.
@@ -115,6 +124,13 @@ def prefetch_step_async(draft_indices, draft_phys_to_logical, target_logical_to_
     with torch.cuda.stream(stream):
         # Flatten indices
         flat_indices = draft_indices.view(-1)
+
+        # Optionally subsample to respect a prefetch ratio and avoid touching
+        # too many pages. This is a lightweight per-window approximation of the
+        # more expensive global frequency-based scheme in `prefetch_kv`.
+        if 0.0 < fetch_ratio < 1.0 and flat_indices.numel() > 0:
+            k = max(1, int(flat_indices.numel() * fetch_ratio))
+            flat_indices = flat_indices[:k]
         
         # Filter valid physical indices (must be < capacity)
         valid_mask = flat_indices < len(draft_phys_to_logical)
@@ -138,8 +154,10 @@ def prefetch_step_async(draft_indices, draft_phys_to_logical, target_logical_to_
         target_physical = target_logical_to_phys[final_logical]
         
         # Touch pages (simple sum)
-        # Optimization: We don't need to sum the whole block, just touching one element per cache line might be enough,
-        # but sum() is a robust way to ensure read.
+        # Optimization: We don't need to sum the whole block, just touching one
+        # element per cache line might be enough, but sum() is a robust way to
+        # ensure read. Using standard PyTorch ops keeps everything non-blocking
+        # and fully stream-aware so that it can overlap with model compute.
         selected_pages = pool_buf[0].index_select(0, target_physical)
         _ = selected_pages.sum()
 
@@ -151,6 +169,11 @@ def prefetch_kv(draft_model, target_model, draft_indices_history, fetch_ratio: f
     Implements Option 2: Merge indices by frequency and retrieve 80% of the most frequent ones.
     """
     if not draft_indices_history:
+        return
+
+    # Only prefetch when Quest is actually page-limited; otherwise it is pure overhead.
+    target_controller = target_model.model.iController
+    if not target_controller.need_estimate():
         return
 
     # 1. Aggregate indices from all draft steps
@@ -186,23 +209,25 @@ def prefetch_kv(draft_model, target_model, draft_indices_history, fetch_ratio: f
     top_logical = unique_logical[sorted_idx[:num_to_fetch]]
     
     # 4. Map Logical -> Target Physical
-    target_controller = target_model.model.iController
     target_phys_list = target_controller.kv_cache.indicies
-    target_phys_tensor = torch.tensor(target_phys_list, device=target_model.device, dtype=torch.long)
+    target_phys_tensor = torch.tensor(target_phys_list, device=target_model.device, dtype=torch.int32)
     
     # Ensure logical indices are within target's range
     valid_target_mask = top_logical < len(target_phys_tensor)
     final_logical = top_logical[valid_target_mask]
     target_physical = target_phys_tensor[final_logical]
     
-    # 5. Touch Target Pages
-    # Access the KV pool buffer
-    # buf shape: (num_layers, capacity, 2, block_len, num_heads, head_dim)
-    pool_buf = target_controller.kv_cache.pool.buf
+    if target_physical.numel() == 0:
+        return
     
-    # We touch layer 0. Reading triggers cache fill.
-    selected_pages = pool_buf[0].index_select(0, target_physical)
-    _ = selected_pages.sum()
+    # 5. Touch Target Pages via dedicated CUDA kernel (no large index_select tensor)
+    # kv pool buffer layout: (num_layers, capacity, 2, block_len, num_heads, head_dim)
+    pool_buf = target_controller.kv_cache.pool.buf
+    kv_layer0 = pool_buf[0]
+    
+    # Use Quest's custom kernel to prefetch pages into GPU caches.
+    from quest.utils import _kernels  # local import to avoid circular deps
+    _kernels.prefetch_kv_pages(kv_layer0, target_physical)
 
 def _flatten_indices(indices):
     """Helper: flatten list-of-tensors or a single tensor into a Python list."""
@@ -371,11 +396,12 @@ def main():
         start_time = time.time()
         
         # 1. Draft Phase
+        torch.cuda.nvtx.range_push("draft_block")
         draft_indices = []
         draft_tokens = []
         
         temp_input = curr_input_ids
-
+        
         for _ in range(DRAFT_AHEAD_LEN):
             with torch.no_grad():
                 draft_out = draft_model(
@@ -393,15 +419,35 @@ def main():
             
             temp_input = next_draft_token
             draft_past_key_values = draft_out.past_key_values
-
+        torch.cuda.nvtx.range_pop()
+        
         # 2. Prefetch KV for Target (once per speculative window, on side stream)
+        torch.cuda.nvtx.range_push("prefetch_block")
         if draft_indices and (window_idx % PREFETCH_WINDOW_STRIDE) == 0:
             # Ensure prefetch stream sees the latest draft indices computed on default stream.
             prefetch_stream.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(prefetch_stream):
-                prefetch_kv(draft_model, target_model, draft_indices, fetch_ratio=PREFETCH_RATIO)
+                # Build mapping Draft Physical -> Logical -> Target Physical on the
+                # side stream so that all GPU work associated with prefetching
+                # can overlap with the main compute stream.
+                draft_phys_to_logical, target_logical_to_phys = build_prefetch_maps(
+                    draft_model, target_model
+                )
+                if draft_phys_to_logical is not None and target_logical_to_phys is not None:
+                    pool_buf = target_model.model.iController.kv_cache.pool.buf
+                    for step_indices in draft_indices:
+                        prefetch_step_async(
+                            step_indices,
+                            draft_phys_to_logical,
+                            target_logical_to_phys,
+                            pool_buf,
+                            prefetch_stream,
+                            fetch_ratio=PREFETCH_RATIO,
+                        )
+        torch.cuda.nvtx.range_pop()
         
         # 3. Target Phase (Verification)
+        torch.cuda.nvtx.range_push("target_verify")
         target_indices_list = []
         verified_count = 0
         t_input = curr_input_ids
@@ -440,6 +486,7 @@ def main():
                 target_indices_list.append(target_model.model.iController.topk_dindices_buffer.clone())
             next_target_token = torch.argmax(t_out.logits[:, -1, :], dim=-1, keepdim=True)
             curr_input_ids = next_target_token
+        torch.cuda.nvtx.range_pop()
         
         # Stats (page overlap in logical page space)
         if target_indices_list:
